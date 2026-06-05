@@ -4,6 +4,44 @@ import User from "../models/User.js"
 import imagekit from "../configs/imageKit.js"
 import openai from '../configs/openai.js'
 
+const getGeminiErrorPayload = (error) => {
+    return error?.error || error?.response?.data?.error || error?.response?.data || error
+}
+
+const getRetryDelay = (payload) => {
+    const details = Array.isArray(payload?.details) ? payload.details : []
+    const retryInfo = details.find((detail) => detail?.retryDelay)
+    return retryInfo?.retryDelay
+}
+
+const sendAiError = (res, error) => {
+    const payload = getGeminiErrorPayload(error)
+    const status = error?.status || error?.response?.status || payload?.code || 500
+    const retryDelay = getRetryDelay(payload)
+    const providerMessage = payload?.message || error?.message || "AI request failed"
+
+    console.error("Gemini API error:", {
+        status,
+        code: payload?.code,
+        providerStatus: payload?.status,
+        message: providerMessage,
+        retryDelay,
+    })
+
+    if (status === 429) {
+        return res.status(429).json({
+            success: false,
+            message: `Gemini quota/rate limit hit. Please wait${retryDelay ? ` ${retryDelay}` : " a minute"} and try again, or check billing/quota in Google AI Studio.`,
+            details: providerMessage,
+        })
+    }
+
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+        success: false,
+        message: providerMessage,
+    })
+}
+
 
 // Text-based AI Chat Message Controller
 export const textMessageController = async (req, res) => {
@@ -18,10 +56,14 @@ export const textMessageController = async (req, res) => {
         const {chatId, prompt} = req.body
 
         const chat = await Chat.findOne({userId, _id: chatId})
+        if(!chat){
+            return res.status(404).json({success: false, message: "Chat not found"})
+        }
+
         chat.messages.push({role: "user", content: prompt, timestamp: Date.now(), isImage: false})
 
         const { choices } = await openai.chat.completions.create({
-        model: "gemini-2.0-flash",
+        model: process.env.GEMINI_MODEL || "gemini-3.5-flash",
         messages: [
             {
                 role: "user",
@@ -38,7 +80,7 @@ export const textMessageController = async (req, res) => {
     await User.updateOne({_id: userId}, {$inc: {credits: -1}})
 
     } catch (error) {
-        res.json({success: false, message: error.message})
+        sendAiError(res, error)
     }
 }
 
@@ -53,6 +95,9 @@ export const imageMessageController = async (req, res) => {
         const {prompt, chatId, isPublished} = req.body
         // Find chat
         const chat = await Chat.findOne({userId, _id: chatId})
+        if(!chat){
+            return res.status(404).json({success: false, message: "Chat not found"})
+        }
 
          // Push user message
          chat.messages.push({
